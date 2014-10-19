@@ -8,14 +8,20 @@
 #include <stdarg.h>
 #include <signal.h>
 #include <sys/time.h>
-#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
-static ssize_t get_a_line(char *buf, size_t size, FILE *stream)
+int smaps_fd; // use raw I/O in signal handler, to avoid e.g. malloc deadlock
+FILE *out;
+_Bool verbose;
+
+static ssize_t get_a_line(char *buf, size_t size, int fd)
 {
 	if (size == 0) return -1; // now size is at least 1
 	
 	// read some stuff, at most `size - 1' bytes (we're going to add a null), into the buffer
-	size_t bytes_read = fread(buf, 1, size - 1, stream);
+	ssize_t bytes_read = read(fd, buf, size - 1);
 	
 	// if we got EOF and read zero bytes, return -1
 	if (bytes_read == 0) return -1;
@@ -26,7 +32,7 @@ static ssize_t get_a_line(char *buf, size_t size, FILE *stream)
 	if (found)
 	{
 		size_t end_of_newline_displacement = (found - buf) + 1;
-		(void) fseek(stream, 
+		(void) lseek(fd, 
 				end_of_newline_displacement - bytes_read /* i.e. negative if we read more */,
 				SEEK_CUR);
 		buf[end_of_newline_displacement - 1] = '\0';
@@ -45,11 +51,24 @@ static unsigned long total_resident = 0;
 static unsigned long total_dirty = 0;
 static unsigned long total_shared = 0;
 
-void flush_mapping_info(unsigned long *p_size, unsigned long *p_resident, unsigned long *p_dirty,
-		unsigned long *p_shared)
+static unsigned long sample_num;
+
+void flush_mapping_info(_Bool print, unsigned long *p_size, unsigned long *p_resident, unsigned long *p_dirty,
+		unsigned long *p_shared, const char *suffix)
 {
-	fprintf(stderr, "size %ld kB, resident %ld kB, dirty %ld kB, shared %ld kB\n",
-		*p_size, *p_resident, *p_dirty, *p_shared);
+	const char *pad1, *pad2;
+	if (suffix)
+	{
+		pad1 = " ";
+		pad2 = suffix;
+	}
+	else
+	{
+		pad1 = "";
+		pad2 = "";
+	}
+	if (print) fprintf(stderr, "== %d sample %lu%s%s == size %ld kB, resident %ld kB, dirty %ld kB, shared %ld kB\n",
+		getpid(), sample_num, pad1, pad2, *p_size, *p_resident, *p_dirty, *p_shared);
 	total_size += *p_size;
 	*p_size = 0;
 	total_resident += *p_resident;
@@ -72,8 +91,11 @@ void read_smaps(void)
 	
 	const int PAGE_SIZE = sysconf(_SC_PAGE_SIZE);
 
-	FILE *smaps = fopen("/proc/self/smaps", "r");
-	assert(smaps);
+	assert(smaps_fd != -1);
+	off_t new_off = lseek(smaps_fd, 0, SEEK_SET);
+	assert(new_off == 0);
+	
+	++sample_num;
 	
 	unsigned long cur_size = 0;
 	unsigned long cur_resident = 0;
@@ -91,7 +113,7 @@ void read_smaps(void)
 	char linebuf[8192];
 	_Bool first_line = 1;
 	ssize_t nread;
-	while (-1 != (nread = get_a_line(linebuf, sizeof linebuf, smaps)))
+	while (-1 != (nread = get_a_line(linebuf, sizeof linebuf, smaps_fd)))
 	{
 		rest[0] = '\0';
 		if ((linebuf[0] >= '0' && linebuf[0] <= '9')
@@ -99,11 +121,14 @@ void read_smaps(void)
 		{
 			/* It's a maps line. If we're not the first one, flush the stats 
 			 * for the last one. */
-			if (!first_line) flush_mapping_info(&cur_size, &cur_resident, &cur_dirty, &cur_shared);
+			if (!first_line) flush_mapping_info(verbose, &cur_size, &cur_resident, &cur_dirty, &cur_shared, NULL);
 			first_line = 0;
-			/* Alwways re-print the line, minus the newline, followed by a tab. */
-			fwrite(linebuf, nread - 1, 1, stderr);
-			fputc('\t', stderr);
+			/* If we're verbose, re-print the line, minus the newline, followed by a tab. */
+			if (verbose)
+			{
+				fwrite(linebuf, nread - 1, 1, stderr);
+				fputc('\t', stderr);
+			}
 			
 			int fields_read = sscanf(linebuf, 
 				"%lx-%lx %c%c%c%c %8x %2x:%2x %d %4095[\x01-\x09\x0b-\xff]\n",
@@ -152,17 +177,34 @@ void read_smaps(void)
 			}
 		}
 	} // end while read line
-	flush_mapping_info(&cur_size, &cur_resident, &cur_dirty, &cur_shared);
 	
-	fclose(smaps);
+	/* flush the last line. */
+	flush_mapping_info(verbose, &cur_size, &cur_resident, &cur_dirty, &cur_shared, NULL);
+
+	/* flush the totals */
+	flush_mapping_info(1, &total_size, &total_resident, &total_dirty, &total_shared, "totals");
 }
 
 static void print_sample(int ignored)
 {
+	/* Sometimes, reading smaps can incur a lot of system execution overhead. 
+	 * (FIXME: understand why.)
+	 * So, to compensate and avoid cumulative slowdowns, 
+	 * we re-set the timerdifference the time we've spent in read_smaps and re-add it on to the timer. */
+	struct itimerval cur_value = { (struct timeval) { 0, 0 }, (struct timeval) { 0, 0 } };
+	int ret = getitimer(ITIMER_PROF, &cur_value);
+	assert(cur_value.it_value.tv_usec > 0 || cur_value.it_value.tv_sec > 0);
+	assert(ret == 0);
+	
+	
 	/* To keep it simple, for now let's say a sample is 
 	 * - the /proc/<pid>/maps mapping line
 	 * - a few numbers: total size, resident, dirty, shared */
 	read_smaps();
+	
+	/* Re-set the timer to the value it had when we started. */
+	ret = setitimer(ITIMER_PROF, &cur_value, NULL);
+	assert(ret == 0);
 }
 
 static void print_exit_summary(void)
@@ -171,10 +213,9 @@ static void print_exit_summary(void)
 	{
 		char buffer[4096];
 		size_t bytes;
-		FILE *smaps = fopen("/proc/self/smaps", "r");
-		if (smaps)
+		if (smaps_fd)
 		{
-			while (0 < (bytes = fread(buffer, 1, sizeof(buffer), smaps)))
+			while (0 < (bytes = read(smaps_fd, buffer, sizeof(buffer))))
 			{
 				fwrite(buffer, 1, bytes, stderr);
 			}
@@ -187,21 +228,45 @@ static void print_exit_summary(void)
 static void init(void) __attribute__((constructor));
 static void init(void)
 {
-	unsigned long sample_frequency_us = 100 * 1000; // default 100ms
+	if (getenv("MEMPROF_DELAY_STARTUP")) sleep(10);
+	
+	unsigned long sample_period_us = 250 * 1000; // default 250ms
 	/* How to make this work? SIGALRM might be used by the program. 
 	 * Or the program might use sleep. 
 	 * We use ITIMER_PROF, because no others profiler is likely to be running.
 	 * It uses SIGPROF. */
 	struct itimerval new_value = { 
 		/* current value */ (struct timeval) {
-			sample_frequency_us / (1000 * 1000), 
-			sample_frequency_us % (1000 * 1000)
+			sample_period_us / (1000 * 1000), 
+			sample_period_us % (1000 * 1000)
 		},
 		/* interval a.k.a. reset-to value */ (struct timeval) {
-			sample_frequency_us / (1000 * 1000), 
-			sample_frequency_us % (1000 * 1000)
+			sample_period_us / (1000 * 1000), 
+			sample_period_us % (1000 * 1000)
 		}
 	};
+	
+	if (getenv("MEMPROF_OUT"))
+	{
+		out = fopen(getenv("MEMPROF_OUT"), "w");
+		assert(out);
+	}
+	else
+	{
+		out = stderr;
+	}
+	
+	if (getenv("MEMPROF_VERBOSE"))
+	{
+		if (atoi(getenv("MEMPROF_VERBOSE")) != 0)
+		{
+			verbose = 1;
+		}
+	}
+
+	smaps_fd = open("/proc/self/smaps", O_RDONLY);
+	assert(smaps_fd != -1);
+	
 	struct itimerval old_value = { (struct timeval) { 0, 0 }, (struct timeval) { 0, 0 } };
 	int ret = setitimer(ITIMER_PROF, &new_value, &old_value);
 	assert(ret == 0);
